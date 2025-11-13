@@ -1,15 +1,11 @@
 // server.js
-// Free, pragmatic scraper: accepts JSON filters and posts each property to a webhook (Make.com)
-// WARNING: Works for low-volume testing only. May be blocked by websites.
+// Browserless.io-powered scraper: lightweight and cloud-ready
 
 import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import puppeteer from "puppeteer-core";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import pLimit from "p-limit";
-
-puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
@@ -17,9 +13,14 @@ app.use(bodyParser.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 3000;
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || "2", 10);
 const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "30000", 10);
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 const USER_AGENT =
   process.env.USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36";
+
+if (!BROWSERLESS_TOKEN) {
+  console.warn("⚠️  BROWSERLESS_TOKEN not set! Get one from browserless.io");
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -38,12 +39,11 @@ async function postWebhook(url, payload) {
   }
 }
 
-// Minimal link dedupe
 function uniq(arr) {
   return Array.from(new Set(arr));
 }
 
-// Main endpoint: call this from Make.com (or curl)
+// Main endpoint
 app.post("/scrape-webhook", async (req, res) => {
   const {
     location = "Edmonton",
@@ -61,27 +61,37 @@ app.post("/scrape-webhook", async (req, res) => {
     return res.status(400).json({ success: false, error: "webhookUrl required" });
   }
 
-  // immediate response so Make isn't waiting
-  res.json({ success: true, status: "started", message: "Scraping started in background" });
+  if (!BROWSERLESS_TOKEN) {
+    return res.status(500).json({ 
+      success: false, 
+      error: "BROWSERLESS_TOKEN not configured" 
+    });
+  }
+
+  // Immediate response
+  res.json({ 
+    success: true, 
+    status: "started", 
+    message: "Scraping started in background",
+    usingBrowserless: true 
+  });
 
   (async () => {
     let browser;
     try {
-      browser = await puppeteer.launch({
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-        ],
+      // Connect to Browserless.io
+      const browserWSEndpoint = `wss://chrome.browserless.io?token=${BROWSERLESS_TOKEN}&stealth`;
+      
+      console.log("Connecting to Browserless.io...");
+      browser = await puppeteer.connect({
+        browserWSEndpoint,
       });
 
       const page = await browser.newPage();
       await page.setUserAgent(USER_AGENT);
       await page.setViewport({ width: 1280, height: 900 });
 
-      // Build a Google query that finds realtor.ca listings in the location
+      // Build Google query
       const qParts = [`site:realtor.ca "${location}"`];
       if (bedrooms) qParts.push(`${bedrooms} bedroom`);
       if (budget) qParts.push(`$${budget}`);
@@ -93,7 +103,7 @@ app.post("/scrape-webhook", async (req, res) => {
       await page.goto(googleUrl, { waitUntil: "networkidle2", timeout: NAV_TIMEOUT });
       await sleep(1200);
 
-      // Extract realtor.ca links from Google results
+      // Extract realtor.ca links
       let links = await page.evaluate(() => {
         const anchors = Array.from(document.querySelectorAll("a"));
         const urls = anchors
@@ -104,7 +114,7 @@ app.post("/scrape-webhook", async (req, res) => {
 
       links = uniq(links).slice(0, maxResults * 3);
 
-      // fallback: try to search realtor.ca list page if Google didn't work
+      // Fallback to realtor.ca list page
       if ((!links || links.length === 0) && useGoogleFallback) {
         const listUrl = `https://www.realtor.ca/ab/edmonton/real-estate`;
         await page.goto(listUrl, { waitUntil: "networkidle2", timeout: NAV_TIMEOUT });
@@ -119,7 +129,6 @@ app.post("/scrape-webhook", async (req, res) => {
       links = uniq(links).slice(0, maxResults);
       console.log("Candidate links:", links.length);
 
-      // notify started
       await postWebhook(webhookUrl, {
         event: "started",
         location,
@@ -144,9 +153,7 @@ app.post("/scrape-webhook", async (req, res) => {
             await page2.goto(link, { waitUntil: "networkidle2", timeout: NAV_TIMEOUT });
             await sleep(800 + Math.floor(Math.random() * 800));
 
-            // Try to extract JSON blob or meta tags
             const data = await page2.evaluate(() => {
-              // Try to parse preloaded JSON
               try {
                 const scripts = Array.from(document.querySelectorAll("script"));
                 for (const s of scripts) {
@@ -155,7 +162,6 @@ app.post("/scrape-webhook", async (req, res) => {
                     const m = txt.match(/window\.__PRELOADED_STATE__\s*=\s*({[\s\S]*?});/);
                     if (m && m[1]) {
                       const obj = JSON.parse(m[1]);
-                      // site specific, attempt safe extraction
                       const prop = obj?.propertyDetails || obj?.Property || obj;
                       return {
                         mls: prop?.MlsNumber || null,
@@ -172,7 +178,6 @@ app.post("/scrape-webhook", async (req, res) => {
               } catch (e) {
                 // ignore
               }
-              // fallback: meta tags / og
               try {
                 const title = document.querySelector('meta[property="og:title"]')?.content || null;
                 const desc = document.querySelector('meta[property="og:description"]')?.content || null;
@@ -189,7 +194,6 @@ app.post("/scrape-webhook", async (req, res) => {
             console.error("Detail page error", link, err.message);
           }
 
-          // post each property immediately
           await postWebhook(webhookUrl, {
             event: "property",
             index: counter,
@@ -197,7 +201,6 @@ app.post("/scrape-webhook", async (req, res) => {
             property: { ...prop, scrapedAt: new Date().toISOString() },
           });
 
-          // polite random delay
           await sleep(900 + Math.floor(Math.random() * 1100));
         })
       );
@@ -210,10 +213,10 @@ app.post("/scrape-webhook", async (req, res) => {
         timestamp: new Date().toISOString(),
       });
 
-      await browser.close();
+      await browser.disconnect();
     } catch (err) {
       console.error("Scrape error", err.message);
-      if (browser) await browser.close();
+      if (browser) await browser.disconnect();
       await postWebhook(webhookUrl, {
         event: "error",
         message: err.message,
@@ -223,7 +226,23 @@ app.post("/scrape-webhook", async (req, res) => {
   })();
 });
 
-app.get("/", (req, res) => res.send("Simple realtor scraper running"));
+app.get("/", (req, res) => {
+  res.json({ 
+    status: "running",
+    service: "realtor scraper",
+    browserless: !!BROWSERLESS_TOKEN,
+    message: "POST to /scrape-webhook to start scraping"
+  });
+});
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "healthy",
+    browserlessConfigured: !!BROWSERLESS_TOKEN 
+  });
+});
 
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🌐 Browserless.io: ${BROWSERLESS_TOKEN ? '✅ Configured' : '❌ Not configured'}`);
+});
