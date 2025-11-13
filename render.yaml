@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: realtor-scraper-browserless
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 18.17.0
+      - key: BROWSERLESS_TOKEN
+        sync: false
+      - key: CONCURRENCY
+        value: 2
+      - key: NAV_TIMEOUT
+        value: 30000
