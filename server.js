@@ -5,7 +5,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
-import puppeteer from "puppeteer-extra";
+import puppeteer from "puppeteer-core";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import pLimit from "p-limit";
 
@@ -226,3 +226,4 @@ app.post("/scrape-webhook", async (req, res) => {
 app.get("/", (req, res) => res.send("Simple realtor scraper running"));
 
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+
